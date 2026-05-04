@@ -216,8 +216,3 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-# Ignore the large dataset
-data/ 
-# But allow small sample images for the project requirements
-!data/samples/
-
