@@ -217,7 +217,12 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 # Ignore the large dataset
-data/ 
+data/cars_test/
+data/cars_train/
+     
 # But allow small sample images for the project requirements
 !data/samples/
-
+!data/car_devkit/
+# Do NOT ignore any files inside the samples directory
+!data/samples/*
+!data/car_devkit/*
