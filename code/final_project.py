@@ -1,11 +1,18 @@
-import tensorflow as tf
-import numpy as np
-import matplotlib.pyplot as plt
 import cv2
-
-from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input, decode_predictions
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tensorflow as tf
+from scipy.io import loadmat
+from sklearn.metrics import confusion_matrix
+from sklearn.model_selection import train_test_split
 from tensorflow.keras.preprocessing import image
-
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input, decode_predictions
+from tensorflow.keras import layers, models
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 # -----------------------------
 # 1. Load Model
 # -----------------------------
@@ -39,7 +46,7 @@ def visualize_predictions(image_paths):
         plt.title(f"{decoded[1]}\n{decoded[2]:.2f}")
 
     plt.tight_layout()
-    plt.show()
+#    plt.show()
 
 # -----------------------------
 # 4. Grad-CAM
@@ -87,7 +94,7 @@ def show_gradcam(img_path):
     plt.imshow(superimposed)
     plt.axis('off')
     plt.title("Grad-CAM")
-    plt.show()
+ #   plt.show()
 
 # -----------------------------
 # 5. Dataset
@@ -162,3 +169,198 @@ for img_path in test_images[:3]:
 print("\n===== Summary =====")
 print("Model: ResNet50 (ImageNet pretrained)")
 print("Evaluation: Top-1 + Top-5 + Grad-CAM + Visualization")
+
+
+
+
+# ==========================================
+# PART B: STANFORD CARS TRAINING
+# ==========================================
+print("\n--- Phase 1: Preparing Data ---")
+data_dir = 'archive'
+train_img_dir = os.path.join(data_dir, 'cars_train', 'cars_train')
+train_annos   = os.path.join(data_dir, 'car_devkit', 'devkit', 'cars_train_annos.mat')
+class_meta    = os.path.join(data_dir, 'car_devkit', 'devkit', 'cars_meta.mat')
+
+# 1. LOAD & SPLIT DATA
+annos = loadmat(train_annos)
+annotations = annos['annotations'][0]
+
+fnames = [str(a['fname'][0]).split('/')[-1] for a in annotations]
+labels = [str(int(a['class'][0][0]) - 1) for a in annotations]
+
+full_df = pd.DataFrame({'filename': fnames, 'class': labels})
+
+# Split 15% off the train set to use as our fully-labeled test set
+train_df, test_df = train_test_split(full_df, test_size=0.15, random_state=42, stratify=full_df['class'])
+class_names = [str(c[0]) for c in loadmat(class_meta)['class_names'][0]]
+
+print(f"Total labeled images: {len(full_df)}")
+print(f"Training/Val images: {len(train_df)}")
+print(f"Testing images: {len(test_df)}")
+
+# 2. GENERATORS
+datagen_resnet = ImageDataGenerator(preprocessing_function=preprocess_input, validation_split=0.2)
+
+train_gen_resnet = datagen_resnet.flow_from_dataframe(
+    train_df, train_img_dir,
+    x_col="filename", y_col="class", subset="training",
+    target_size=(224, 224), batch_size=32, class_mode="categorical"
+)
+
+val_gen_resnet = datagen_resnet.flow_from_dataframe(
+    train_df, train_img_dir,
+    x_col="filename", y_col="class", subset="validation",
+    target_size=(224, 224), batch_size=32, class_mode="categorical", shuffle=False
+)
+
+test_gen_resnet = ImageDataGenerator(preprocessing_function=preprocess_input).flow_from_dataframe(
+    test_df, train_img_dir, # Pointing to train_img_dir because that's where the split files live
+    x_col="filename", y_col="class",
+    target_size=(224, 224), batch_size=32, class_mode="categorical", shuffle=False
+)
+
+# 3. RESNET MODEL (STAGE 1)
+print("\n--- Phase 2: Training ResNet (Stage 1) ---")
+base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224,224,3))
+base_model.trainable = False
+
+resnet_model = models.Sequential([
+    base_model,
+    layers.GlobalAveragePooling2D(),
+    layers.Dense(1024, activation='relu'),
+    layers.Dropout(0.5),
+    layers.Dense(196, activation='softmax')
+])
+
+resnet_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+early_stop1 = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+
+history_stage1 = resnet_model.fit(
+    train_gen_resnet, validation_data=val_gen_resnet, epochs=5, callbacks=[early_stop1]
+)
+
+# 4. RESNET MODEL (STAGE 2)
+print("\n--- Phase 3: Fine-Tuning ResNet ---")
+base_model.trainable = True
+for layer in base_model.layers[:145]:
+    layer.trainable = False
+
+resnet_model.compile(optimizer=tf.keras.optimizers.Adam(1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
+early_stop2 = EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2)
+
+train_gen_resnet.reset()
+val_gen_resnet.reset()
+
+history_stage2 = resnet_model.fit(
+    train_gen_resnet, validation_data=val_gen_resnet, epochs=15, callbacks=[early_stop2, reduce_lr]
+)
+
+# 5. BASELINE CNN
+print("\n--- Phase 4: Training Baseline CNN ---")
+cnn_datagen = ImageDataGenerator(rescale=1./255, validation_split=0.2)
+
+train_gen_cnn = cnn_datagen.flow_from_dataframe(
+    train_df, train_img_dir,
+    x_col="filename", y_col="class", subset="training",
+    target_size=(224,224), batch_size=32, class_mode="categorical"
+)
+
+val_gen_cnn = cnn_datagen.flow_from_dataframe(
+    train_df, train_img_dir,
+    x_col="filename", y_col="class", subset="validation",
+    target_size=(224,224), batch_size=32, class_mode="categorical", shuffle=False
+)
+
+test_gen_cnn = ImageDataGenerator(rescale=1./255).flow_from_dataframe(
+    test_df, train_img_dir,
+    x_col="filename", y_col="class",
+    target_size=(224,224), batch_size=32, class_mode="categorical", shuffle=False
+)
+
+baseline_cnn = models.Sequential([
+    layers.Input(shape=(224,224,3)),
+    layers.Conv2D(32, 3, activation='relu'),
+    layers.MaxPooling2D(),
+    layers.Conv2D(64, 3, activation='relu'),
+    layers.MaxPooling2D(),
+    layers.GlobalAveragePooling2D(), # <-- Memory fix applied here
+    layers.Dense(128, activation='relu'),
+    layers.Dense(196, activation='softmax')
+])
+
+baseline_cnn.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+early_stop_cnn = EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True)
+
+history_cnn = baseline_cnn.fit(
+    train_gen_cnn, validation_data=val_gen_cnn, epochs=20, callbacks=[early_stop_cnn]
+)
+
+# 6. TEST EVALUATION
+print("\n--- Phase 5: Final Evaluation ---")
+test_gen_resnet.reset()
+resnet_acc = resnet_model.evaluate(test_gen_resnet)[1]
+print(f"ResNet Test Accuracy: {resnet_acc*100:.2f}%")
+
+test_gen_cnn.reset()
+cnn_acc = baseline_cnn.evaluate(test_gen_cnn)[1]
+print(f"CNN Test Accuracy: {cnn_acc*100:.2f}%")
+
+# 7. PLOTS
+print("\n--- Phase 6: Plotting ---")
+resnet_val = history_stage1.history['val_accuracy'] + history_stage2.history['val_accuracy']
+cnn_val = history_cnn.history['val_accuracy']
+
+max_len = max(len(resnet_val), len(cnn_val))
+resnet_val += [np.nan] * (max_len - len(resnet_val))
+cnn_val += [np.nan] * (max_len - len(cnn_val))
+
+plt.figure(figsize=(10,6))
+plt.plot(resnet_val, label='ResNet50')
+plt.plot(cnn_val, label='CNN')
+plt.axvline(x=len(history_stage1.history['val_accuracy'])-1, linestyle='--', color='gray')
+plt.legend()
+plt.title("Validation Accuracy")
+plt.show()
+
+plt.figure(figsize=(10,6))
+plt.plot(history_stage1.history['loss'] + history_stage2.history['loss'], label='ResNet Loss')
+plt.plot(history_cnn.history['loss'], label='CNN Loss')
+plt.legend()
+plt.title("Training Loss")
+plt.show()
+
+# 8. CONFUSION MATRIX
+print("\n--- Phase 7: Confusion Matrix ---")
+test_gen_resnet.reset()
+y_pred = np.argmax(resnet_model.predict(test_gen_resnet), axis=1)
+y_true = test_gen_resnet.classes
+
+cm = confusion_matrix(y_true, y_pred)
+confusion_scores = cm.sum(axis=1) - np.diag(cm)
+top_classes = np.argsort(confusion_scores)[-10:]
+cm_subset = cm[top_classes][:, top_classes]
+
+inv_map = {v: int(k) for k, v in test_gen_resnet.class_indices.items()}
+top_labels = [class_names[inv_map[i]][:20] for i in top_classes]
+
+plt.figure(figsize=(12,10))
+sns.heatmap(cm_subset, cmap='Blues', xticklabels=top_labels, yticklabels=top_labels, annot=True, fmt='d')
+plt.title("Top 10 Most Confused Classes")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# ==========================================
+# 9. SAVE MODELS
+# ==========================================
+print("\n--- Phase 8: Saving Models ---")
+
+# Save the fine-tuned ResNet model
+resnet_model.save('final_resnet_cars.keras')
+print("Saved ResNet50 model as 'final_resnet_cars.keras'")
+
+# Save the Baseline CNN model
+baseline_cnn.save('final_baseline_cnn.keras')
+print("Saved Baseline CNN model as 'final_baseline_cnn.keras'")
